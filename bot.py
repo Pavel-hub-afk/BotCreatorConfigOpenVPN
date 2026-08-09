@@ -270,31 +270,56 @@ async def revoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @restricted
 async def list_clients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show valid (non-revoked) clients."""
+    """Show valid (non-revoked) clients with last connection date."""
     status_msg = await update.message.reply_text("⏳ Получаю список клиентов...")
 
     try:
         ssh = ssh_connect()
-        out, _ = remote_cmd(
-            ssh,
-            f"tail -n +2 {EASYRSA_DIR}/pki/index.txt | grep '^V' | cut -d '=' -f 2",
+
+        # Получаем клиентов с датами последнего подключения из трекера
+        tracker_cmd = (
+            f"TRACKER_DIR=/var/lib/ovpn-tracker; "
+            f"for client in $(tail -n +2 {EASYRSA_DIR}/pki/index.txt | grep '^V' | cut -d '=' -f 2 | grep -v '^server$'); do "
+            f'if [ -f "$TRACKER_DIR/$client.last_seen" ]; then '
+            f'echo "$client|$(stat -c %Y $TRACKER_DIR/$client.last_seen)"; '
+            f'else echo "$client|never"; fi; '
+            f"done"
         )
+        out, _ = remote_cmd(ssh, tracker_cmd)
         ssh.close()
 
         if not out:
             await status_msg.edit_text("📭 Нет активных клиентов.")
             return
 
-        clients = out.split("\n")
-        # first entry is usually "server" — filter it out for user-friendliness
-        user_clients = [c for c in clients if c != "server"]
-        if not user_clients:
+        # Парсим: client|timestamp или client|never
+        import datetime
+        now_ts = datetime.datetime.now().timestamp()
+        lines = []
+        for entry in out.split("\n"):
+            if "|" not in entry:
+                continue
+            client, ts_str = entry.split("|", 1)
+            if ts_str == "never":
+                lines.append(f"• `{client}` — ⚠️ ни разу не подключался")
+            else:
+                ts = int(ts_str)
+                ago_days = int((now_ts - ts) / 86400)
+                last_dt = datetime.datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
+                if ago_days == 0:
+                    lines.append(f"• `{client}` — 🟢 сегодня ({last_dt})")
+                elif ago_days < 7:
+                    lines.append(f"• `{client}` — {ago_days} дн. назад ({last_dt})")
+                elif ago_days < 180:
+                    lines.append(f"• `{client}` — {ago_days} дн. назад ({last_dt})")
+                else:
+                    lines.append(f"• `{client}` — 🔴 {ago_days} дн. назад ({last_dt})")
+
+        if not lines:
             await status_msg.edit_text("📭 Нет пользовательских клиентов (только серверный).")
             return
 
-        text = f"📋 Активные клиенты ({len(user_clients)}):\n\n" + "\n".join(
-            f"• `{c}`" for c in user_clients
-        )
+        text = f"📋 Клиенты ({len(lines)}):\n\n" + "\n".join(lines)
         await status_msg.edit_text(text)
 
     except Exception as exc:
