@@ -17,7 +17,7 @@ from functools import wraps
 
 import paramiko
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ---------------------------------------------------------------------------
@@ -315,6 +315,20 @@ def main() -> None:
         return
 
     app = Application.builder().token(TOKEN).build()
+
+    # --- Регистрация меню команд (выпадающий список при вводе /) ---
+    async def set_bot_commands(app_obj: Application) -> None:
+        commands = [
+            BotCommand("start", "Приветствие и список команд"),
+            BotCommand("newclient", "Создать клиента и получить .ovpn конфиг"),
+            BotCommand("getconfig", "Скачать готовый .ovpn конфиг"),
+            BotCommand("revoke", "Отозвать сертификат клиента"),
+            BotCommand("list", "Список активных клиентов"),
+        ]
+        await app_obj.bot.set_my_commands(commands)
+        logger.info("Bot commands menu has been set")
+
+    app.post_init = set_bot_commands
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("newclient", newclient))
