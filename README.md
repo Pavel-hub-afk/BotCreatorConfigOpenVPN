@@ -10,7 +10,9 @@ Telegram-бот для удалённого администрирования O
 | `/newclient <имя>` | Создать клиента и получить `.ovpn` конфиг |
 | `/getconfig <имя>` | Повторно скачать готовый `.ovpn` |
 | `/revoke <имя>` | Отозвать сертификат клиента |
-| `/list` | Список активных клиентов |
+| `/list` | Список клиентов с датой последнего подключения (MSK) |
+
+При вводе `/` в Telegram отображается выпадающее меню команд с описаниями.
 
 ## Требования
 
@@ -25,7 +27,7 @@ Telegram-бот для удалённого администрирования O
 ```bash
 mkdir -p /opt/ovpn-bot
 cd /opt/ovpn-bot
-git clone https://github.com/yourname/telegram_bot_for_create_config_openvpn.git .
+git clone https://github.com/Pavel-hub-afk/BotCreatorConfigOpenVPN.git .
 ```
 
 ### 2. Виртуальное окружение и зависимости
@@ -90,6 +92,44 @@ systemctl status ovpn-bot
 | Логи (последние 50) | `journalctl -u ovpn-bot -n 50` |
 | Занимаемое место | `journalctl -u ovpn-bot --disk-usage` |
 
+## Отслеживание активности клиентов
+
+Бот показывает дату последнего подключения каждого клиента в команде `/list`. Для этого на сервере работает инфраструктура:
+
+```
+OpenVPN ──► /var/log/openvpn/status.log (обновляется каждые 15 сек)
+                │
+Cron (5 мин) ──► /opt/ovpn-bot/track-connections.sh
+                │
+                ▼
+     /var/lib/ovpn-tracker/*.last_seen
+                │
+                ▼
+     /list — дата последнего подключения (MSK)
+```
+
+### Компоненты на сервере
+
+| Компонент | Путь | Описание |
+|-----------|------|----------|
+| Статус-лог OpenVPN | `/var/log/openvpn/status.log` | Пишется OpenVPN, список текущих подключений |
+| Трекер | `/opt/ovpn-bot/track-connections.sh` | Читает status.log, создаёт `.last_seen` файлы |
+| Маркеры активности | `/var/lib/ovpn-tracker/*.last_seen` | Файл-маркер для каждого подключавшегося клиента |
+
+### Настройка OpenVPN
+
+В `/etc/openvpn/server/server.conf` добавлена строка:
+
+```
+status /var/log/openvpn/status.log 15
+```
+
+### Cron
+
+```
+*/5 * * * * /opt/ovpn-bot/track-connections.sh
+```
+
 ## Памятка: внесение изменений
 
 ```
@@ -98,12 +138,12 @@ systemctl status ovpn-bot
 │     Правишь код → тестируешь                        │
 │     git add -A                                      │
 │     git commit -m "описание правок"                 │
-│     git push origin main                            │
+│     git push origin master                          │
 │                                                     │
 │  2. НА СЕРВЕРЕ                                      │
 │     ssh root@твой_сервер                            │
 │     cd /opt/ovpn-bot                                │
-│     git pull origin main                            │
+│     git pull origin master                          │
 │                                                     │
 │     # Если обновился requirements.txt:              │
 │     source venv/bin/activate                        │
