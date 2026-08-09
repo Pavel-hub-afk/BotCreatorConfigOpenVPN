@@ -294,7 +294,10 @@ async def list_clients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         # Парсим: client|timestamp или client|never
         import datetime
-        now_ts = datetime.datetime.now().timestamp()
+        from zoneinfo import ZoneInfo
+        MSK = ZoneInfo("Europe/Moscow")
+        now_dt = datetime.datetime.now(MSK)
+        now_ts = now_dt.timestamp()
         lines = []
         for entry in out.split("\n"):
             if "|" not in entry:
@@ -305,7 +308,7 @@ async def list_clients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             else:
                 ts = int(ts_str)
                 ago_days = int((now_ts - ts) / 86400)
-                last_dt = datetime.datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
+                last_dt = datetime.datetime.fromtimestamp(ts, tz=MSK).strftime("%d.%m.%Y %H:%M")
                 if ago_days == 0:
                     lines.append(f"• `{client}` — 🟢 сегодня ({last_dt})")
                 elif ago_days < 7:
