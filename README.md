@@ -11,8 +11,25 @@ Telegram-бот для удалённого администрирования O
 | `/getconfig <имя>` | Повторно скачать готовый `.ovpn` |
 | `/revoke <имя>` | Отозвать сертификат клиента |
 | `/list` | Список клиентов с датой последнего подключения (MSK) |
+| `/info <имя>` | Полная информация о клиенте |
 
 При вводе `/` в Telegram отображается выпадающее меню команд с описаниями.
+
+## Структура проекта
+
+```
+.
+├── bot.py                  ← точка входа + обработчики команд
+├── config.py               ← конфигурация (env, константы)
+├── ssh_utils.py            ← SSH-подключение, контекстный менеджер
+├── formatting.py           ← форматирование дат, байтов
+├── scripts/                ← bash-скрипты (выполняются на сервере)
+│   ├── client-list.sh      ← список клиентов с датами активности
+│   ├── client-info.sh      ← полная информация по клиенту
+│   └── track-connections.sh ← трекер активности (cron)
+├── requirements.txt
+└── README.md
+```
 
 ## Требования
 
@@ -90,31 +107,32 @@ systemctl status ovpn-bot
 | Перезапустить | `systemctl restart ovpn-bot` |
 | Логи (real-time) | `journalctl -u ovpn-bot -f` |
 | Логи (последние 50) | `journalctl -u ovpn-bot -n 50` |
-| Занимаемое место | `journalctl -u ovpn-bot --disk-usage` |
 
 ## Отслеживание активности клиентов
 
-Бот показывает дату последнего подключения каждого клиента в команде `/list`. Для этого на сервере работает инфраструктура:
+Бот показывает дату последнего подключения каждого клиента в команде `/list` и детальную информацию в `/info`. Для этого на сервере работает инфраструктура:
 
 ```
 OpenVPN ──► /var/log/openvpn/status.log (обновляется каждые 15 сек)
                 │
-Cron (5 мин) ──► /opt/ovpn-bot/track-connections.sh
+Cron (5 мин) ──► scripts/track-connections.sh
                 │
                 ▼
      /var/lib/ovpn-tracker/*.last_seen
                 │
                 ▼
      /list — дата последнего подключения (MSK)
+     /info — полная информация: статус, IP, трафик, сертификат
 ```
 
 ### Компоненты на сервере
 
 | Компонент | Путь | Описание |
 |-----------|------|----------|
-| Статус-лог OpenVPN | `/var/log/openvpn/status.log` | Пишется OpenVPN, список текущих подключений |
-| Трекер | `/opt/ovpn-bot/track-connections.sh` | Читает status.log, создаёт `.last_seen` файлы |
-| Маркеры активности | `/var/lib/ovpn-tracker/*.last_seen` | Файл-маркер для каждого подключавшегося клиента |
+| Статус-лог OpenVPN | `/var/log/openvpn/status.log` | Список текущих подключений |
+| Трекер | `/opt/ovpn-bot/scripts/track-connections.sh` | Создаёт `.last_seen` файлы |
+| Маркеры активности | `/var/lib/ovpn-tracker/*.last_seen` | Дата последнего подключения каждого клиента |
+| Скрипты бота | `/opt/ovpn-bot/scripts/client-*.sh` | Вызываются командами `/list` и `/info` |
 
 ### Настройка OpenVPN
 
@@ -127,7 +145,7 @@ status /var/log/openvpn/status.log 15
 ### Cron
 
 ```
-*/5 * * * * /opt/ovpn-bot/track-connections.sh
+*/5 * * * * /opt/ovpn-bot/scripts/track-connections.sh >> /var/log/ovpn-tracker.log 2>&1
 ```
 
 ## Памятка: внесение изменений
