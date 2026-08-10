@@ -22,6 +22,7 @@ fi
 # Имя клиента — второе поле после запятой
 sed -n '/^HEADER,CLIENT_LIST/,/^HEADER,ROUTING_TABLE/p' "$STATUS_FILE" \
     | grep '^CLIENT_LIST,' \
+    | grep -v ',UNDEF,' \
     | cut -d',' -f2 \
     | while IFS= read -r client; do
         [ -z "$client" ] && continue
