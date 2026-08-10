@@ -10,44 +10,19 @@ Telegram-бот для администрирования OpenVPN сервера
 """
 
 import io
-import logging
-import os
 import re
 from functools import wraps
 
-import paramiko
-from dotenv import load_dotenv
 from telegram import BotCommand, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-load_dotenv()
-
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-SSH_HOST = os.getenv("SSH_HOST")
-SSH_USER = os.getenv("SSH_USER", "root")
-SSH_PASSWORD = os.getenv("SSH_PASSWORD")
-SSH_KEY_PATH = os.getenv("SSH_KEY_PATH")
-
-# Comma-separated list of allowed Telegram user IDs
-ALLOWED_USER_IDS: set[int] = set(
-    int(uid.strip())
-    for uid in os.getenv("ALLOWED_USER_IDS", "").split(",")
-    if uid.strip()
+from config import (
+    TOKEN, SSH_HOST, ALLOWED_USER_IDS,
+    EASYRSA_DIR, COMMON_TXT, PKI_INLINE, SCRIPTS_DIR,
+    logger,
 )
-
-EASYRSA_DIR = "/etc/openvpn/server/easy-rsa"
-PKI_ISSUED = f"{EASYRSA_DIR}/pki/issued"
-PKI_INLINE = f"{EASYRSA_DIR}/pki/inline/private"
-COMMON_TXT = "/etc/openvpn/server/client-common.txt"
-
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+from ssh_utils import ssh_session, remote_cmd, client_exists
+from formatting import fmt_bytes, fmt_last_seen, fmt_last_seen_plain
 
 
 # ---------------------------------------------------------------------------
@@ -58,29 +33,6 @@ def sanitize(name: str) -> str:
     """Sanitize client name exactly like openvpn-install.sh."""
     sanitized = re.sub(r"[^0-9a-zA-Z_-]", "_", name)
     return sanitized if sanitized else "client"
-
-
-def ssh_connect() -> paramiko.SSHClient:
-    """Open an SSH connection to the OpenVPN server."""
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-    kwargs: dict = {"hostname": SSH_HOST, "username": SSH_USER, "timeout": 10}
-    if SSH_KEY_PATH:
-        kwargs["key_filename"] = SSH_KEY_PATH
-    elif SSH_PASSWORD:
-        kwargs["password"] = SSH_PASSWORD
-    else:
-        raise RuntimeError("Either SSH_PASSWORD or SSH_KEY_PATH must be set in .env")
-
-    ssh.connect(**kwargs)
-    return ssh
-
-
-def remote_cmd(ssh: paramiko.SSHClient, cmd: str) -> tuple[str, str]:
-    """Run a command on the server, return (stdout, stderr)."""
-    _, stdout, stderr = ssh.exec_command(cmd)
-    return stdout.read().decode().strip(), stderr.read().decode().strip()
 
 
 def restricted(handler):
@@ -97,12 +49,6 @@ def restricted(handler):
         return await handler(update, context)
 
     return wrapper
-
-
-def client_exists(ssh: paramiko.SSHClient, client: str) -> bool:
-    """Check if a client certificate already exists."""
-    out, _ = remote_cmd(ssh, f"test -f {PKI_ISSUED}/{client}.crt && echo YES || echo NO")
-    return out == "YES"
 
 
 # ---------------------------------------------------------------------------
@@ -138,38 +84,30 @@ async def newclient(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     status_msg = await update.message.reply_text(f"⏳ Создаю клиента *{client}*...")
 
     try:
-        ssh = ssh_connect()
+        with ssh_session() as ssh:
+            if client_exists(ssh, client):
+                await status_msg.edit_text(f"❌ Клиент *{client}* уже существует! Используйте /getconfig для скачивания.")
+                return
 
-        # --- Guard: already exists? ---
-        if client_exists(ssh, client):
-            await status_msg.edit_text(f"❌ Клиент *{client}* уже существует! Используйте /getconfig для скачивания.")
-            ssh.close()
-            return
+            out, err = remote_cmd(
+                ssh,
+                f"cd {EASYRSA_DIR} && ./easyrsa --batch --days=3650 build-client-full '{client}' nopass",
+            )
+            if err:
+                logger.warning("easyrsa stderr: %s", err)
 
-        # --- Build certificate ---
-        out, err = remote_cmd(
-            ssh,
-            f"cd {EASYRSA_DIR} && ./easyrsa --batch --days=3650 build-client-full '{client}' nopass",
-        )
-        if err:
-            logger.warning("easyrsa stderr: %s", err)
+            ovpn_path = f"/tmp/{client}.ovpn"
+            remote_cmd(
+                ssh,
+                f"grep -vh '^#' {COMMON_TXT} {PKI_INLINE}/{client}.inline > {ovpn_path}",
+            )
 
-        # --- Build .ovpn ---
-        ovpn_path = f"/tmp/{client}.ovpn"
-        remote_cmd(
-            ssh,
-            f"grep -vh '^#' {COMMON_TXT} {PKI_INLINE}/{client}.inline > {ovpn_path}",
-        )
+            sftp = ssh.open_sftp()
+            with sftp.open(ovpn_path, "r") as f:
+                ovpn_content = f.read().decode()
+            sftp.close()
+            ssh.exec_command(f"rm -f {ovpn_path}")
 
-        # --- Download .ovpn via SFTP ---
-        sftp = ssh.open_sftp()
-        with sftp.open(ovpn_path, "r") as f:
-            ovpn_content = f.read().decode()
-        sftp.close()
-        ssh.exec_command(f"rm -f {ovpn_path}")
-        ssh.close()
-
-        # --- Send file to user ---
         file_obj = io.BytesIO(ovpn_content.encode("utf-8"))
         file_obj.name = f"{client}.ovpn"
 
@@ -196,26 +134,22 @@ async def getconfig(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     status_msg = await update.message.reply_text(f"⏳ Ищу конфиг *{client}*...")
 
     try:
-        ssh = ssh_connect()
+        with ssh_session() as ssh:
+            if not client_exists(ssh, client):
+                await status_msg.edit_text(f"❌ Клиент *{client}* не найден.")
+                return
 
-        if not client_exists(ssh, client):
-            await status_msg.edit_text(f"❌ Клиент *{client}* не найден.")
-            ssh.close()
-            return
+            ovpn_path = f"/tmp/{client}.ovpn"
+            remote_cmd(
+                ssh,
+                f"grep -vh '^#' {COMMON_TXT} {PKI_INLINE}/{client}.inline > {ovpn_path}",
+            )
 
-        # Build .ovpn on the fly
-        ovpn_path = f"/tmp/{client}.ovpn"
-        remote_cmd(
-            ssh,
-            f"grep -vh '^#' {COMMON_TXT} {PKI_INLINE}/{client}.inline > {ovpn_path}",
-        )
-
-        sftp = ssh.open_sftp()
-        with sftp.open(ovpn_path, "r") as f:
-            ovpn_content = f.read().decode()
-        sftp.close()
-        ssh.exec_command(f"rm -f {ovpn_path}")
-        ssh.close()
+            sftp = ssh.open_sftp()
+            with sftp.open(ovpn_path, "r") as f:
+                ovpn_content = f.read().decode()
+            sftp.close()
+            ssh.exec_command(f"rm -f {ovpn_path}")
 
         file_obj = io.BytesIO(ovpn_content.encode("utf-8"))
         file_obj.name = f"{client}.ovpn"
@@ -243,25 +177,22 @@ async def revoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     status_msg = await update.message.reply_text(f"⏳ Отзываю доступ *{client}*...")
 
     try:
-        ssh = ssh_connect()
+        with ssh_session() as ssh:
+            if not client_exists(ssh, client):
+                await status_msg.edit_text(f"❌ Клиент *{client}* не найден.")
+                return
 
-        if not client_exists(ssh, client):
-            await status_msg.edit_text(f"❌ Клиент *{client}* не найден.")
-            ssh.close()
-            return
+            out, err = remote_cmd(
+                ssh,
+                f"cd {EASYRSA_DIR} && "
+                f"./easyrsa --batch revoke '{client}' && "
+                f"./easyrsa --batch --days=3650 gen-crl && "
+                f"rm -f /etc/openvpn/server/crl.pem && "
+                f"cp {EASYRSA_DIR}/pki/crl.pem /etc/openvpn/server/crl.pem",
+            )
+            if err:
+                logger.warning("revoke stderr: %s", err)
 
-        out, err = remote_cmd(
-            ssh,
-            f"cd {EASYRSA_DIR} && "
-            f"./easyrsa --batch revoke '{client}' && "
-            f"./easyrsa --batch --days=3650 gen-crl && "
-            f"rm -f /etc/openvpn/server/crl.pem && "
-            f"cp {EASYRSA_DIR}/pki/crl.pem /etc/openvpn/server/crl.pem",
-        )
-        if err:
-            logger.warning("revoke stderr: %s", err)
-
-        ssh.close()
         await status_msg.edit_text(f"✅ Доступ клиента *{client}* отозван!")
 
     except Exception as exc:
@@ -275,41 +206,19 @@ async def list_clients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     status_msg = await update.message.reply_text("⏳ Получаю список клиентов...")
 
     try:
-        ssh = ssh_connect()
-
-        # Получаем клиентов с датами последнего подключения из трекера
-        out, _ = remote_cmd(ssh, "/opt/ovpn-bot/scripts/client-list.sh")
-        ssh.close()
+        with ssh_session() as ssh:
+            out, _ = remote_cmd(ssh, f"{SCRIPTS_DIR}/client-list.sh")
 
         if not out:
             await status_msg.edit_text("📭 Нет активных клиентов.")
             return
 
-        # Парсим: client|timestamp или client|never
-        import datetime
-        from zoneinfo import ZoneInfo
-        MSK = ZoneInfo("Europe/Moscow")
-        now_dt = datetime.datetime.now(MSK)
-        now_ts = now_dt.timestamp()
         lines = []
         for entry in out.split("\n"):
             if "|" not in entry:
                 continue
             client, ts_str = entry.split("|", 1)
-            if ts_str == "never":
-                lines.append(f"• `{client}` — ⚠️ ни разу не подключался")
-            else:
-                ts = int(ts_str)
-                ago_days = int((now_ts - ts) / 86400)
-                last_dt = datetime.datetime.fromtimestamp(ts, tz=MSK).strftime("%d.%m.%Y %H:%M")
-                if ago_days == 0:
-                    lines.append(f"• `{client}` — 🟢 сегодня ({last_dt})")
-                elif ago_days < 7:
-                    lines.append(f"• `{client}` — {ago_days} дн. назад ({last_dt})")
-                elif ago_days < 180:
-                    lines.append(f"• `{client}` — {ago_days} дн. назад ({last_dt})")
-                else:
-                    lines.append(f"• `{client}` — 🔴 {ago_days} дн. назад ({last_dt})")
+            lines.append(f"• `{client}` — {fmt_last_seen(ts_str)}")
 
         if not lines:
             await status_msg.edit_text("📭 Нет пользовательских клиентов (только серверный).")
@@ -334,13 +243,10 @@ async def client_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     status_msg = await update.message.reply_text(f"⏳ Собираю информацию о *{client}*...")
 
     try:
-        ssh = ssh_connect()
+        with ssh_session() as ssh:
+            out, _ = remote_cmd(ssh, f"{SCRIPTS_DIR}/client-info.sh {client}")
 
-        # Один вызов собирает все данные через bash-скрипт
-        out, _ = remote_cmd(ssh, f"/opt/ovpn-bot/scripts/client-info.sh {client}")
-        ssh.close()
-
-        # Парсим вывод
+        # Парсим секционный вывод
         sections = {}
         current_section = None
         for line in out.split("\n"):
@@ -350,29 +256,30 @@ async def client_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             elif current_section:
                 sections[current_section].append(line)
 
-        cert_line = "\n".join(sections.get("CERT", []))
-        enddate_str = "\n".join(sections.get("ENDDATE", []))
-        issued_str = "\n".join(sections.get("ISSUED", []))
-        ipp_line = "\n".join(sections.get("IPP", []))
-        status_line = "\n".join(sections.get("STATUS", []))
-        tracker_raw = "\n".join(sections.get("TRACKER", []))
+        def _section(name: str) -> str:
+            return "\n".join(sections.get(name, []))
 
-        # --- Собираем ответ ---
+        cert_line = _section("CERT")
+        enddate_str = _section("ENDDATE")
+        issued_str = _section("ISSUED")
+        ipp_line = _section("IPP")
+        status_line = _section("STATUS")
+        tracker_raw = _section("TRACKER")
+
         lines = [f"Информация о клиенте: `{client}`", ""]
 
         # Сертификат
         if cert_line and cert_line != "N/A":
             parts = cert_line.split()
             if parts and parts[0] == "V":
-                lines.append(f"Сертификат: ✅ валиден")
+                lines.append("Сертификат: ✅ валиден")
             elif parts and parts[0] == "R":
-                lines.append(f"Сертификат: ❌ отозван")
+                lines.append("Сертификат: ❌ отозван")
             else:
                 lines.append(f"Сертификат: {cert_line}")
         else:
-            lines.append(f"Сертификат: ❌ не найден")
+            lines.append("Сертификат: ❌ не найден")
 
-        # Даты
         if issued_str and issued_str != "N/A":
             lines.append(f"Выпущен: {issued_str}")
         if enddate_str and enddate_str != "N/A":
@@ -389,7 +296,6 @@ async def client_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # Статус подключения
         if status_line and status_line != "N/A":
             parts = status_line.split(",")
-            # CLIENT_LIST, name, real_addr, virt_addr, virt_ipv6, bytes_recv, bytes_sent, connected_since, ...
             if len(parts) >= 6:
                 real_addr = parts[2] if len(parts) > 2 else "?"
                 bytes_recv = int(parts[5]) if len(parts) > 5 else 0
@@ -397,45 +303,20 @@ async def client_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 lines.append("")
                 lines.append("Сейчас в сети: ✅ да")
                 lines.append(f"Реальный IP: {real_addr.split(':')[0] if ':' in real_addr else real_addr}")
-                lines.append(f"Трафик: {_fmt_bytes(bytes_recv)} принято / {_fmt_bytes(bytes_sent)} отправлено")
+                lines.append(f"Трафик: {fmt_bytes(bytes_recv)} принято / {fmt_bytes(bytes_sent)} отправлено")
                 if len(parts) >= 8:
                     lines.append(f"В сети с: {parts[7]}")
         else:
             lines.append("")
             lines.append("Сейчас в сети: ❌ нет")
 
-        # Последняя активность
-        import datetime
-        from zoneinfo import ZoneInfo
-        MSK = ZoneInfo("Europe/Moscow")
-        now_dt = datetime.datetime.now(MSK)
-        now_ts = now_dt.timestamp()
-
-        if tracker_raw and tracker_raw != "never":
-            ts = int(tracker_raw)
-            ago_days = int((now_ts - ts) / 86400)
-            last_dt = datetime.datetime.fromtimestamp(ts, tz=MSK).strftime("%d.%m.%Y %H:%M")
-            if ago_days == 0:
-                lines.append(f"Последняя активность: сегодня {last_dt} (MSK)")
-            else:
-                lines.append(f"Последняя активность: {ago_days} дн. назад ({last_dt} MSK)")
-        else:
-            lines.append("Последняя активность: нет данных")
+        lines.append(f"Последняя активность: {fmt_last_seen_plain(tracker_raw)}")
 
         await status_msg.edit_text("\n".join(lines))
 
     except Exception as exc:
         logger.exception("Failed to get info for %s", client)
         await status_msg.edit_text(f"❌ Ошибка: {exc}")
-
-
-def _fmt_bytes(n: int) -> str:
-    """Format bytes to human-readable size."""
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024:
-            return f"{n} {unit}"
-        n //= 1024
-    return f"{n} TB"
 
 
 # ---------------------------------------------------------------------------
@@ -452,7 +333,6 @@ def main() -> None:
 
     app = Application.builder().token(TOKEN).build()
 
-    # --- Регистрация меню команд (выпадающий список при вводе /) ---
     async def set_bot_commands(app_obj: Application) -> None:
         commands = [
             BotCommand("start", "Приветствие и список команд"),
