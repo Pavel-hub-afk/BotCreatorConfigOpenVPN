@@ -118,7 +118,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/newclient <имя> — создать пользователя и получить .ovpn конфиг\n"
         "/getconfig <имя> — скачать уже существующий .ovpn\n"
         "/revoke <имя> — отозвать доступ у пользователя\n"
-        "/list — показать список активных клиентов"
+        "/list — показать список активных клиентов\n"
+        "/info <имя> — полная информация о клиенте"
     )
 
 
@@ -330,6 +331,138 @@ async def list_clients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await status_msg.edit_text(f"❌ Ошибка: {exc}")
 
 
+@restricted
+async def client_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show detailed info about a specific client."""
+    if not context.args:
+        await update.message.reply_text("❌ Укажите имя клиента.\nПример: /info akinin_julia_vpn")
+        return
+
+    client = sanitize(" ".join(context.args))
+    status_msg = await update.message.reply_text(f"⏳ Собираю информацию о *{client}*...")
+
+    try:
+        ssh = ssh_connect()
+
+        # Один вызов собирает все данные
+        info_cmd = (
+            f"PKI='{EASYRSA_DIR}/pki'; "
+            f"CLIENT='{client}'; "
+            f"echo '---CERT---'; "
+            f"grep \"/CN=$CLIENT$\" $PKI/index.txt; "
+            f"echo '---ENDDATE---'; "
+            f"openssl x509 -in $PKI/issued/$CLIENT.crt -enddate -noout 2>/dev/null | cut -d'=' -f2 || echo 'N/A'; "
+            f"echo '---ISSUED---'; "
+            f"openssl x509 -in $PKI/issued/$CLIENT.crt -startdate -noout 2>/dev/null | cut -d'=' -f2 || echo 'N/A'; "
+            f"echo '---IPP---'; "
+            f"grep \"^$CLIENT,\" /etc/openvpn/server/ipp.txt 2>/dev/null || echo 'N/A'; "
+            f"echo '---STATUS---'; "
+            f"grep \"^CLIENT_LIST,$CLIENT,\" /var/log/openvpn/status.log 2>/dev/null || echo 'N/A'; "
+            f"echo '---TRACKER---'; "
+            f"TRACKER_FILE=/var/lib/ovpn-tracker/$CLIENT.last_seen; "
+            f"if [ -f \"$TRACKER_FILE\" ]; then stat -c %Y \"$TRACKER_FILE\"; else echo 'never'; fi"
+        )
+        out, _ = remote_cmd(ssh, info_cmd)
+        ssh.close()
+
+        # Парсим вывод
+        sections = {}
+        current_section = None
+        for line in out.split("\n"):
+            if line.startswith("---") and line.endswith("---"):
+                current_section = line.strip("-")
+                sections[current_section] = []
+            elif current_section:
+                sections[current_section].append(line)
+
+        cert_line = "\n".join(sections.get("CERT", []))
+        enddate_str = "\n".join(sections.get("ENDDATE", []))
+        issued_str = "\n".join(sections.get("ISSUED", []))
+        ipp_line = "\n".join(sections.get("IPP", []))
+        status_line = "\n".join(sections.get("STATUS", []))
+        tracker_raw = "\n".join(sections.get("TRACKER", []))
+
+        # --- Собираем ответ ---
+        lines = [f"Информация о клиенте: `{client}`", ""]
+
+        # Сертификат
+        if cert_line and cert_line != "N/A":
+            parts = cert_line.split()
+            if parts and parts[0] == "V":
+                lines.append(f"Сертификат: ✅ валиден")
+            elif parts and parts[0] == "R":
+                lines.append(f"Сертификат: ❌ отозван")
+            else:
+                lines.append(f"Сертификат: {cert_line}")
+        else:
+            lines.append(f"Сертификат: ❌ не найден")
+
+        # Даты
+        if issued_str and issued_str != "N/A":
+            lines.append(f"Выпущен: {issued_str}")
+        if enddate_str and enddate_str != "N/A":
+            lines.append(f"Истекает: {enddate_str}")
+
+        # IP
+        if ipp_line and ipp_line != "N/A":
+            parts = ipp_line.split(",")
+            if len(parts) >= 3:
+                lines.append(f"Виртуальный IP: {parts[1]} / {parts[2]}")
+            elif len(parts) >= 2:
+                lines.append(f"Виртуальный IP: {parts[1]}")
+
+        # Статус подключения
+        if status_line and status_line != "N/A":
+            parts = status_line.split(",")
+            # CLIENT_LIST, name, real_addr, virt_addr, virt_ipv6, bytes_recv, bytes_sent, connected_since, ...
+            if len(parts) >= 6:
+                real_addr = parts[2] if len(parts) > 2 else "?"
+                bytes_recv = int(parts[5]) if len(parts) > 5 else 0
+                bytes_sent = int(parts[6]) if len(parts) > 6 else 0
+                lines.append("")
+                lines.append("Сейчас в сети: ✅ да")
+                lines.append(f"Реальный IP: {real_addr.split(':')[0] if ':' in real_addr else real_addr}")
+                lines.append(f"Трафик: {_fmt_bytes(bytes_recv)} принято / {_fmt_bytes(bytes_sent)} отправлено")
+                if len(parts) >= 8:
+                    lines.append(f"В сети с: {parts[7]}")
+        else:
+            lines.append("")
+            lines.append("Сейчас в сети: ❌ нет")
+
+        # Последняя активность
+        import datetime
+        from zoneinfo import ZoneInfo
+        MSK = ZoneInfo("Europe/Moscow")
+        now_dt = datetime.datetime.now(MSK)
+        now_ts = now_dt.timestamp()
+
+        if tracker_raw and tracker_raw != "never":
+            ts = int(tracker_raw)
+            ago_days = int((now_ts - ts) / 86400)
+            last_dt = datetime.datetime.fromtimestamp(ts, tz=MSK).strftime("%d.%m.%Y %H:%M")
+            if ago_days == 0:
+                lines.append(f"Последняя активность: сегодня {last_dt} (MSK)")
+            else:
+                lines.append(f"Последняя активность: {ago_days} дн. назад ({last_dt} MSK)")
+        else:
+            lines.append("Последняя активность: нет данных")
+
+        await status_msg.edit_text("\n".join(lines))
+
+    except Exception as exc:
+        logger.exception("Failed to get info for %s", client)
+        await status_msg.edit_text(f"❌ Ошибка: {exc}")
+
+
+def _fmt_bytes(n: int) -> str:
+    """Format bytes to human-readable size."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n} {unit}"
+        n //= 1024
+    return f"{n} TB"
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -352,6 +485,7 @@ def main() -> None:
             BotCommand("getconfig", "Скачать готовый .ovpn конфиг"),
             BotCommand("revoke", "Отозвать сертификат клиента"),
             BotCommand("list", "Список активных клиентов"),
+            BotCommand("info", "Полная информация о клиенте"),
         ]
         await app_obj.bot.set_my_commands(commands)
         logger.info("Bot commands menu has been set")
@@ -363,6 +497,7 @@ def main() -> None:
     app.add_handler(CommandHandler("getconfig", getconfig))
     app.add_handler(CommandHandler("revoke", revoke))
     app.add_handler(CommandHandler("list", list_clients))
+    app.add_handler(CommandHandler("info", client_info))
 
     logger.info("Bot polling started")
     app.run_polling()
