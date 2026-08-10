@@ -278,15 +278,7 @@ async def list_clients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         ssh = ssh_connect()
 
         # Получаем клиентов с датами последнего подключения из трекера
-        tracker_cmd = (
-            f"TRACKER_DIR=/var/lib/ovpn-tracker; "
-            f"for client in $(tail -n +2 {EASYRSA_DIR}/pki/index.txt | grep '^V' | cut -d '=' -f 2 | grep -v '^server$'); do "
-            f'if [ -f "$TRACKER_DIR/$client.last_seen" ]; then '
-            f'echo "$client|$(stat -c %Y $TRACKER_DIR/$client.last_seen)"; '
-            f'else echo "$client|never"; fi; '
-            f"done"
-        )
-        out, _ = remote_cmd(ssh, tracker_cmd)
+        out, _ = remote_cmd(ssh, "/opt/ovpn-bot/scripts/client-list.sh")
         ssh.close()
 
         if not out:
@@ -344,25 +336,8 @@ async def client_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     try:
         ssh = ssh_connect()
 
-        # Один вызов собирает все данные
-        info_cmd = (
-            f"PKI='{EASYRSA_DIR}/pki'; "
-            f"CLIENT='{client}'; "
-            f"echo '---CERT---'; "
-            f"grep \"/CN=$CLIENT$\" $PKI/index.txt; "
-            f"echo '---ENDDATE---'; "
-            f"openssl x509 -in $PKI/issued/$CLIENT.crt -enddate -noout 2>/dev/null | cut -d'=' -f2 || echo 'N/A'; "
-            f"echo '---ISSUED---'; "
-            f"openssl x509 -in $PKI/issued/$CLIENT.crt -startdate -noout 2>/dev/null | cut -d'=' -f2 || echo 'N/A'; "
-            f"echo '---IPP---'; "
-            f"grep \"^$CLIENT,\" /etc/openvpn/server/ipp.txt 2>/dev/null || echo 'N/A'; "
-            f"echo '---STATUS---'; "
-            f"grep \"^CLIENT_LIST,$CLIENT,\" /var/log/openvpn/status.log 2>/dev/null || echo 'N/A'; "
-            f"echo '---TRACKER---'; "
-            f"TRACKER_FILE=/var/lib/ovpn-tracker/$CLIENT.last_seen; "
-            f"if [ -f \"$TRACKER_FILE\" ]; then stat -c %Y \"$TRACKER_FILE\"; else echo 'never'; fi"
-        )
-        out, _ = remote_cmd(ssh, info_cmd)
+        # Один вызов собирает все данные через bash-скрипт
+        out, _ = remote_cmd(ssh, f"/opt/ovpn-bot/scripts/client-info.sh {client}")
         ssh.close()
 
         # Парсим вывод
